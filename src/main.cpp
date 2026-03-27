@@ -188,7 +188,7 @@ IRAM_ATTR void loop()
     mqttLoop();
 #endif
 
-    // haspDevice.loop();
+    haspDevice.loop();
 
 #if HASP_USE_CONSOLE > 0
     // debugLoop();
