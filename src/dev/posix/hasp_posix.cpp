@@ -53,6 +53,9 @@ PosixDevice::PosixDevice()
     _backlight_power  = 1;
     _backlight_invert = 0;
     _backlight_level  = 255;
+
+    _backlight_pending       = false;
+    _backlight_pending_level = 255;
 }
 
 void PosixDevice::set_config(const JsonObject& settings)
@@ -83,6 +86,20 @@ void PosixDevice::set_config(const JsonObject& settings)
 
 void PosixDevice::reboot()
 {}
+
+void PosixDevice::loop()
+{
+#if USE_MONITOR
+    // Apply deferred backlight update on the main thread.
+    // monitor_backlight() calls SDL rendering functions which are not thread-safe
+    // and must only be called from the main/SDL thread.
+    if(_backlight_pending) {
+        _backlight_pending = false;
+        monitor_backlight(_backlight_pending_level);
+    }
+#endif
+}
+
 void PosixDevice::show_info()
 {
     struct utsname uts;
@@ -179,7 +196,11 @@ void PosixDevice::update_backlight()
     uint8_t level = _backlight_power ? _backlight_level : 0;
     if(_backlight_invert) level = 255 - level;
 #if USE_MONITOR
-    monitor_backlight(level);
+    // Defer to the main thread via loop() — calling monitor_backlight() here
+    // would invoke SDL rendering from the MQTT receive thread, which is not
+    // thread-safe and causes heap corruption / SIGBUS crashes on macOS.
+    _backlight_pending_level = level;
+    _backlight_pending       = true;
 #elif USE_FBDEV
     // set display backlight, if possible
     if(backlight_device != "") {

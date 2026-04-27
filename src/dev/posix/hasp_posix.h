@@ -42,6 +42,8 @@ class PosixDevice : public BaseDevice {
     const char* get_chip_model();
     const char* get_hardware_id();
 
+    void loop() override;
+
     void set_backlight_pin(uint8_t pin);
     void set_backlight_invert(bool invert) override;
     void set_backlight_level(uint8_t val);
@@ -73,6 +75,9 @@ class PosixDevice : public BaseDevice {
     uint8_t _backlight_level;
     uint8_t _backlight_power;
     uint8_t _backlight_invert;
+
+    volatile bool _backlight_pending;  // deferred backlight update for thread safety
+    volatile uint8_t _backlight_pending_level;
 
     void update_backlight();
 };

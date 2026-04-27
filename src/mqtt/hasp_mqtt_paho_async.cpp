@@ -38,7 +38,10 @@ const char FP_CONFIG_GROUP[] PROGMEM = "group";
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <atomic>
+#include <deque>
 #include <mutex>
+#include <string>
 
 #include "MQTTAsync.h"
 
@@ -74,6 +77,60 @@ uint32_t mqttFailedCount;
 
 std::recursive_mutex dispatch_mtx;
 std::recursive_mutex publish_mtx;
+
+// ===== Inbound dispatch queue =====
+// SDL2/LVGL are not thread-safe; any MQTT-arrived command that ultimately
+// touches the renderer (jsonl, config, screenshot, backlight, page, ...) must
+// run on the main thread. Paho's receive thread enqueues here; mqttLoop()
+// drains on the main thread.
+enum class IncomingKind : uint8_t {
+    TopicPayload,
+    HaStatusOnline,
+};
+
+struct IncomingMqttMessage {
+    IncomingKind kind;
+    std::string topic;   // unused for HaStatusOnline
+    std::string payload; // unused for HaStatusOnline
+    bool update;
+    uint8_t source;
+};
+
+static std::mutex incoming_mtx;
+static std::deque<IncomingMqttMessage> incoming_queue;
+static constexpr size_t INCOMING_QUEUE_MAX = 256;
+static std::atomic<uint32_t> incoming_dropped{0};
+
+static void enqueue_incoming(IncomingMqttMessage&& msg)
+{
+    std::lock_guard<std::mutex> lk(incoming_mtx);
+    if(incoming_queue.size() >= INCOMING_QUEUE_MAX) {
+        incoming_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    incoming_queue.push_back(std::move(msg));
+}
+
+static void enqueue_topic_payload(const char* topic, const char* payload, size_t payload_len, bool update,
+                                  uint8_t source)
+{
+    IncomingMqttMessage msg;
+    msg.kind    = IncomingKind::TopicPayload;
+    msg.topic   = topic ? std::string(topic) : std::string();
+    msg.payload = payload ? std::string(payload, payload_len) : std::string();
+    msg.update  = update;
+    msg.source  = source;
+    enqueue_incoming(std::move(msg));
+}
+
+static void enqueue_ha_status_online()
+{
+    IncomingMqttMessage msg;
+    msg.kind   = IncomingKind::HaStatusOnline;
+    msg.update = false;
+    msg.source = TAG_MQTT;
+    enqueue_incoming(std::move(msg));
+}
 
 std::string mqttServer    = MQTT_HOSTNAME;
 std::string mqttUsername  = MQTT_USERNAME;
@@ -159,9 +216,7 @@ static void mqtt_message_cb(char* topic, char* payload, size_t length)
 
         // Group topic
         topic += mqttGroupTopic.length(); // shorten topic
-        dispatch_mtx.lock();
-        dispatch_topic_payload(topic, (const char*)payload, length > 0, TAG_MQTT);
-        dispatch_mtx.unlock();
+        enqueue_topic_payload(topic, (const char*)payload, length, length > 0, TAG_MQTT);
         return;
 
 #ifdef HASP_USE_BROADCAST
@@ -170,19 +225,14 @@ static void mqtt_message_cb(char* topic, char* payload, size_t length)
 
         // /" MQTT_TOPIC_BROADCAST "/ topic
         topic += strlen(MQTT_PREFIX "/" MQTT_TOPIC_BROADCAST "/"); // shorten topic
-        dispatch_mtx.lock();
-        dispatch_topic_payload(topic, (const char*)payload, length > 0, TAG_MQTT);
-        dispatch_mtx.unlock();
+        enqueue_topic_payload(topic, (const char*)payload, length, length > 0, TAG_MQTT);
         return;
 #endif
 
 #ifdef HASP_USE_HA
     } else if(topic == strstr_P(topic, PSTR("homeassistant/status"))) { // HA discovery topic
         if(mqttHAautodiscover && !strcasecmp_P((char*)payload, PSTR("online"))) {
-            dispatch_mtx.lock();
-            dispatch_current_state(TAG_MQTT);
-            dispatch_mtx.unlock();
-            mqtt_ha_register_auto_discovery();
+            enqueue_ha_status_online();
         }
         return;
 #endif
@@ -206,9 +256,7 @@ static void mqtt_message_cb(char* topic, char* payload, size_t length)
             // LOG_TRACE(TAG_MQTT, F("ignoring LWT = online"));
         }
     } else {
-        dispatch_mtx.lock();
-        dispatch_topic_payload(topic, (const char*)payload, length > 0, TAG_MQTT);
-        dispatch_mtx.unlock();
+        enqueue_topic_payload(topic, (const char*)payload, length, length > 0, TAG_MQTT);
     }
 }
 
@@ -436,7 +484,36 @@ void mqttSetup()
     mqttLwtTopic += MQTT_TOPIC_LWT;
 }
 
-IRAM_ATTR void mqttLoop() {};
+IRAM_ATTR void mqttLoop()
+{
+    // Drain inbound MQTT dispatch queue on the main thread.
+    // Bound the per-tick work so a flood of messages can't starve LVGL.
+    constexpr size_t kMaxPerTick = 16;
+    for(size_t i = 0; i < kMaxPerTick; ++i) {
+        IncomingMqttMessage msg;
+        {
+            std::lock_guard<std::mutex> lk(incoming_mtx);
+            if(incoming_queue.empty()) break;
+            msg = std::move(incoming_queue.front());
+            incoming_queue.pop_front();
+        }
+        switch(msg.kind) {
+            case IncomingKind::TopicPayload:
+                dispatch_topic_payload(msg.topic.c_str(), msg.payload.c_str(), msg.update, msg.source);
+                break;
+            case IncomingKind::HaStatusOnline:
+#ifdef HASP_USE_HA
+                dispatch_current_state(TAG_MQTT);
+                mqtt_ha_register_auto_discovery();
+#endif
+                break;
+        }
+    }
+    uint32_t dropped = incoming_dropped.exchange(0, std::memory_order_relaxed);
+    if(dropped) {
+        LOG_WARNING(TAG_MQTT, F("Dispatch queue overflow, dropped %u messages"), (unsigned)dropped);
+    }
+};
 
 void mqttEverySecond()
 {}
